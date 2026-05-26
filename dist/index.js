@@ -3,20 +3,24 @@
  *
  * Discovers Agent Skills from a directory, embeds SKILL.md content into
  * pgvector via an OpenAI-compatible /embeddings endpoint, and provides
- * semantic vector similarity search.
+ * semantic vector similarity search — same pattern as mcphub search_tools.
  *
- * Environment variables (single naming, no aliases):
+ * Environment variables (single naming):
  *   DB_URL                 - PostgreSQL connection string with pgvector
  *   API_BASE_URL           - Embedding API base URL (e.g. https://xxx/v1)
- *   API_KEY                - API key for the embedding provider
- *   EMBEDDING_MODEL        - Model name (e.g. "gemini-embedding-001")
+ *   API_KEY                - API key
+ *   EMBEDDING_MODEL        - Model name (default: text-embedding-3-small)
  *   SKILLSEARCH_SKILLS_DIR - Root directory; each subdirectory = one skill
+ *   TRANSPORT              - "stdio" (default) or "http"
+ *   PORT                   - HTTP port (default: 3000), only used when TRANSPORT=http
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ListToolsRequestSchema, CallToolRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
 import pg from "pg";
 const { Pool } = pg;
+import http from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
@@ -28,6 +32,8 @@ const API_BASE_URL = process.env.API_BASE_URL ?? "";
 const API_KEY = process.env.API_KEY ?? "";
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL ?? "text-embedding-3-small";
 const SKILLS_DIR = process.env.SKILLSEARCH_SKILLS_DIR ?? "";
+const TRANSPORT = (process.env.TRANSPORT ?? "stdio").toLowerCase();
+const PORT = parseInt(process.env.PORT ?? "3000", 10);
 // ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
@@ -62,7 +68,6 @@ async function ensureSchema(db) {
     await db.query(`
     CREATE INDEX IF NOT EXISTS idx_skills_hash ON skills (content_hash);
   `);
-    // pgvector
     try {
         await db.query(`CREATE EXTENSION IF NOT EXISTS vector;`);
         const dims = embeddingDimensions(EMBEDDING_MODEL);
@@ -76,7 +81,6 @@ async function ensureSchema(db) {
             await db.query(`ALTER TABLE skills ADD COLUMN embedding ${vecType}(${dims});`);
             console.error(`[skillsearch] created embedding column ${vecType}(${dims})`);
         }
-        // HNSW index
         if (dims <= 2000) {
             await db.query(`
         CREATE INDEX IF NOT EXISTS idx_skills_embedding
@@ -110,7 +114,7 @@ function embeddingDimensions(model) {
     return 1536;
 }
 // ---------------------------------------------------------------------------
-// Skill discovery — collect ALL files under skill dir
+// Skill discovery — collect ALL files under skill dir (except SKILL.md)
 // ---------------------------------------------------------------------------
 function discoverSkills(rootDir) {
     const skills = [];
@@ -131,13 +135,10 @@ function discoverSkills(rootDir) {
         const { frontmatter } = parseFrontmatter(raw);
         const name = frontmatter["name"] ?? entry.name;
         const description = frontmatter["description"] ?? "";
-        // ALL files recursively under skillDir, excluding SKILL.md itself
         const absMd = path.resolve(skillMdPath);
         const allFiles = walkFiles(skillDir).filter((f) => path.resolve(f) !== absMd);
         skills.push({
-            name,
-            description,
-            frontmatter,
+            name, description, frontmatter,
             skillMdPath: absMd,
             skillDir: path.resolve(skillDir),
             content: raw,
@@ -188,12 +189,11 @@ function sha256(text) {
     return crypto.createHash("sha256").update(text).digest("hex");
 }
 // ---------------------------------------------------------------------------
-// Embedding — single /embeddings call, same as mcphub
+// Embedding — single /embeddings call, same as mcphub generateEmbedding()
 // ---------------------------------------------------------------------------
 async function embed(text) {
     if (!API_BASE_URL || !API_KEY)
         throw new Error("API_BASE_URL / API_KEY not set");
-    // Conservative truncation: 60k chars ≈ 20k tokens
     const input = text.length > 60000 ? text.slice(0, 60000) : text;
     const url = `${API_BASE_URL.replace(/\/+$/, "")}/embeddings`;
     console.error(`[skillsearch] embed → ${url} model=${EMBEDDING_MODEL}`);
@@ -214,19 +214,17 @@ async function embed(text) {
     return vec;
 }
 // ---------------------------------------------------------------------------
-// Indexing — upsert with content-hash skip (same pattern as mcphub)
+// Indexing — upsert with content-hash skip, same pattern as mcphub
 // ---------------------------------------------------------------------------
 async function indexSkills(db, skills) {
     let indexed = 0;
     for (const skill of skills) {
         const hash = sha256(skill.content);
-        // Skip check
         const existing = await db.query(`SELECT content_hash FROM skills WHERE skill_name = $1 AND skill_dir = $2`, [skill.name, skill.skillDir]);
         if (existing.rowCount && existing.rows[0].content_hash === hash) {
             console.error(`[skillsearch] "${skill.name}" unchanged, skip`);
             continue;
         }
-        // Generate embedding
         let embedding = null;
         if (API_BASE_URL && API_KEY) {
             try {
@@ -236,7 +234,6 @@ async function indexSkills(db, skills) {
                 console.warn(`[skillsearch] embed failed "${skill.name}": ${err.message}`);
             }
         }
-        // Upsert
         if (embedding) {
             await db.query(`INSERT INTO skills
            (skill_name, skill_dir, skill_md_path, frontmatter, content, content_hash, all_files, embedding, updated_at)
@@ -273,15 +270,12 @@ async function indexSkills(db, skills) {
 // Search — pure vector cosine similarity, same as mcphub searchToolsByVector
 // ---------------------------------------------------------------------------
 async function searchSkills(db, query, limit, threshold) {
-    // Check embedding column
     const hasCol = await db.query(`
     SELECT 1 FROM information_schema.columns
     WHERE table_name = 'skills' AND column_name = 'embedding';
   `);
-    if (!(hasCol.rowCount && hasCol.rowCount > 0)) {
-        console.error("[skillsearch] no embedding column, returning empty");
+    if (!(hasCol.rowCount && hasCol.rowCount > 0))
         return [];
-    }
     const queryVec = await embed(query);
     const vecStr = `[${queryVec.join(",")}]`;
     const result = await db.query(`SELECT id, skill_name, skill_dir, skill_md_path, frontmatter, content, all_files,
@@ -304,7 +298,7 @@ async function searchSkills(db, query, limit, threshold) {
     }));
 }
 // ---------------------------------------------------------------------------
-// MCP Server
+// MCP Server — tools definition
 // ---------------------------------------------------------------------------
 function createServer() {
     const server = new Server({ name: "skillsearch-mcp-server", version: "1.0.0" }, { capabilities: { tools: {} } });
@@ -312,7 +306,7 @@ function createServer() {
         const tools = [
             {
                 name: "skill_search",
-                description: "Semantic vector search for Agent Skills. Returns matching skills with frontmatter metadata, SKILL.md absolute path, and ALL file paths under the skill directory (references, scripts, assets, etc.). Use this to discover available skills before reading their full content.",
+                description: "Semantic vector search for Agent Skills. Returns matching skills with frontmatter metadata, SKILL.md absolute path, and ALL file paths under the skill directory (references, scripts, assets, templates, etc.). Use this to discover available skills before reading their full content.",
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -322,12 +316,12 @@ function createServer() {
                         },
                         limit: {
                             type: "integer",
-                            description: "Maximum results (default: 5).",
+                            description: "Maximum results to return (default: 5, max: 50).",
                             default: 5,
                         },
                         threshold: {
                             type: "number",
-                            description: "Minimum similarity 0.0–1.0 (default: 0.3). Higher = stricter.",
+                            description: "Minimum similarity threshold 0.0–1.0 (default: 0.3). Higher = stricter.",
                             default: 0.3,
                         },
                     },
@@ -341,7 +335,7 @@ function createServer() {
             },
             {
                 name: "skill_reindex",
-                description: "Re-scan the skills directory and re-index all skills. Use after adding or modifying skills.",
+                description: "Re-scan the skills directory and re-index all skills into the database. Use this after adding or modifying skills.",
                 inputSchema: { type: "object", properties: {}, required: [] },
             },
         ];
@@ -360,12 +354,9 @@ function createServer() {
                 }
                 const results = await searchSkills(db, query, limit, threshold);
                 if (!results.length) {
-                    return {
-                        content: [{ type: "text", text: JSON.stringify({ query, threshold, totalResults: 0, message: "No matching skills found.", skills: [] }, null, 2) }],
-                    };
+                    return { content: [{ type: "text", text: JSON.stringify({ query, threshold, totalResults: 0, message: "No matching skills found. Try a different query or lower the threshold.", skills: [] }, null, 2) }] };
                 }
-                return {
-                    content: [{ type: "text", text: JSON.stringify({
+                return { content: [{ type: "text", text: JSON.stringify({
                                 query, threshold, totalResults: results.length,
                                 skills: results.map((r) => ({
                                     name: r.skill_name,
@@ -376,20 +367,21 @@ function createServer() {
                                     similarity: Math.round(r.similarity * 10000) / 10000,
                                     allFiles: r.all_files,
                                 })),
-                            }, null, 2) }],
-                };
+                            }, null, 2) }] };
             }
             case "skill_list": {
                 const result = await db.query(`SELECT skill_name, skill_dir, skill_md_path, frontmatter, all_files
            FROM skills ORDER BY skill_name`);
-                const skills = result.rows.map((r) => ({
-                    name: r.skill_name,
-                    description: r.frontmatter?.description ?? "",
-                    skillDir: r.skill_dir,
-                    skillMdPath: r.skill_md_path,
-                    fileCount: r.all_files?.length ?? 0,
-                }));
-                return { content: [{ type: "text", text: JSON.stringify({ total: skills.length, skills }, null, 2) }] };
+                return { content: [{ type: "text", text: JSON.stringify({
+                                total: result.rowCount,
+                                skills: result.rows.map((r) => ({
+                                    name: r.skill_name,
+                                    description: r.frontmatter?.description ?? "",
+                                    skillDir: r.skill_dir,
+                                    skillMdPath: r.skill_md_path,
+                                    fileCount: r.all_files?.length ?? 0,
+                                })),
+                            }, null, 2) }] };
             }
             case "skill_reindex": {
                 if (!SKILLS_DIR) {
@@ -406,7 +398,7 @@ function createServer() {
     return server;
 }
 // ---------------------------------------------------------------------------
-// Main
+// Main — boot + connect transport (stdio or http)
 // ---------------------------------------------------------------------------
 async function main() {
     console.error("[skillsearch] starting...");
@@ -414,6 +406,9 @@ async function main() {
     console.error(`  API_BASE_URL   = ${API_BASE_URL || "not set"}`);
     console.error(`  EMBEDDING_MODEL= ${EMBEDDING_MODEL}`);
     console.error(`  SKILLS_DIR     = ${SKILLS_DIR || "MISSING"}`);
+    console.error(`  TRANSPORT      = ${TRANSPORT}`);
+    if (TRANSPORT === "http")
+        console.error(`  PORT           = ${PORT}`);
     if (!DB_URL) {
         console.error("[skillsearch] FATAL: DB_URL not set");
         process.exit(1);
@@ -438,10 +433,55 @@ async function main() {
         const n = await indexSkills(db, skills);
         console.error(`[skillsearch] indexed ${n} (${skills.length - n} unchanged)`);
     }
-    const server = createServer();
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("[skillsearch] MCP server running on stdio");
+    // Create MCP server instance
+    const mcpServer = createServer();
+    if (TRANSPORT === "http") {
+        // ── Streamable HTTP transport ──────────────────────────────────────
+        const httpServer = http.createServer((req, res) => {
+            // CORS headers
+            res.setHeader("Access-Control-Allow-Origin", "*");
+            res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
+            if (req.method === "OPTIONS") {
+                res.writeHead(204);
+                res.end();
+                return;
+            }
+            // Only handle /mcp path (or root for simplicity)
+            const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+            if (url.pathname !== "/mcp" && url.pathname !== "/") {
+                res.writeHead(404);
+                res.end("Not Found");
+                return;
+            }
+            let body = "";
+            req.on("data", (chunk) => { body += chunk; });
+            req.on("end", async () => {
+                let parsedBody;
+                if (body) {
+                    try {
+                        parsedBody = JSON.parse(body);
+                    }
+                    catch { /* let transport handle raw */ }
+                }
+                const transport = new StreamableHTTPServerTransport({
+                    sessionIdGenerator: undefined, // stateless mode
+                });
+                res.on("close", () => transport.close());
+                await mcpServer.connect(transport);
+                await transport.handleRequest(req, res, parsedBody);
+            });
+        });
+        httpServer.listen(PORT, () => {
+            console.error(`[skillsearch] HTTP MCP server listening on :${PORT}/mcp`);
+        });
+    }
+    else {
+        // ── stdio transport (default) ──────────────────────────────────────
+        const transport = new StdioServerTransport();
+        await mcpServer.connect(transport);
+        console.error("[skillsearch] MCP server running on stdio");
+    }
 }
 main().catch((err) => { console.error(`[skillsearch] fatal: ${err}`); process.exit(1); });
 //# sourceMappingURL=index.js.map
