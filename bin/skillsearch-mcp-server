@@ -1,0 +1,51 @@
+#!/usr/bin/env node
+/**
+ * This script is a shim for running the TypeScript source directly
+ * without pre-compilation. Used when running via npx from GitHub.
+ *
+ * It tries the compiled version first, then falls back to tsx.
+ */
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const rootDir = join(__dirname, "..");
+
+async function main() {
+  // Try compiled version first
+  const compiledPath = join(rootDir, "dist", "index.js");
+  if (existsSync(compiledPath)) {
+    await import(compiledPath);
+    return;
+  }
+
+  // Fallback: try tsx
+  const tsxPath = join(rootDir, "node_modules", ".bin", "tsx");
+  const srcPath = join(rootDir, "src", "index.ts");
+
+  if (existsSync(tsxPath)) {
+    const child = spawn(tsxPath, [srcPath], {
+      stdio: "inherit",
+      env: process.env,
+    });
+    child.on("exit", (code) => process.exit(code ?? 0));
+    return;
+  }
+
+  // Last resort: try node with --loader
+  const child = spawn(
+    "node",
+    ["--import", "tsx/esm", srcPath],
+    { stdio: "inherit", env: process.env }
+  );
+  child.on("exit", (code) => process.exit(code ?? 0));
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
