@@ -2,6 +2,8 @@
 
 MCP server that discovers [Agent Skills](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview) from a directory, embeds `SKILL.md` content into PostgreSQL pgvector via an OpenAI-compatible `/embeddings` endpoint, and provides semantic vector cosine similarity search — same pattern as mcphub's `search_tools`.
 
+**Auto-sync**: watches the skills directory with `fs.watch` and automatically indexes new/changed skills and removes deleted ones. Falls back to periodic polling if native file watching is unavailable.
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
@@ -13,6 +15,7 @@ MCP server that discovers [Agent Skills](https://platform.claude.com/docs/en/age
 | `EMBEDDING_MODEL` | No | `text-embedding-3-small` | Model name |
 | `TRANSPORT` | No | `stdio` | `stdio` or `http` |
 | `PORT` | No | `3000` | HTTP port (only when `TRANSPORT=http`) |
+| `WATCH_POLL_INTERVAL` | No | `30000` | Polling interval in ms (fallback mode only) |
 
 ## Transport Modes
 
@@ -46,7 +49,7 @@ Endpoint: `POST /mcp` (and `POST /`)
 
 ### `skill_search`
 
-Semantic vector search for Agent Skills. Returns matching skills with frontmatter metadata, SKILL.md absolute path, and **all** file paths under the skill directory (references, scripts, assets, templates, etc.).
+Semantic vector search for Agent Skills. Returns matching skills with frontmatter metadata, SKILL.md absolute path, and **all** file paths under the skill directory.
 
 Parameters:
 - `query` (string, required) — Natural language search query
@@ -57,9 +60,23 @@ Parameters:
 
 List all indexed skills with names, descriptions, paths, and file counts.
 
-### `skill_reindex`
+## Auto-Sync (File Watching)
 
-Re-scan the skills directory and re-index all skills. Use after adding or modifying skills.
+The server automatically monitors the skills directory for changes:
+
+| Event | Action |
+|---|---|
+| New skill directory created | Indexed automatically |
+| `SKILL.md` modified | Re-indexed automatically |
+| Skill directory removed | Removed from index automatically |
+| Other files changed | Detected, content-hash skip avoids unnecessary re-index |
+
+**Watch strategy**:
+1. **Primary**: `fs.watch` on the root skills directory (detects added/removed skill dirs) + recursive `fs.watch` on each skill sub-directory (detects SKILL.md changes)
+2. **Fallback**: If `fs.watch` is unavailable or errors out, automatically switches to periodic full-scan polling (`WATCH_POLL_INTERVAL`, default 30s)
+3. **Debounce**: Rapid filesystem events are coalesced (500ms) into a single sync pass
+
+No manual `skill_reindex` tool needed — just add, modify, or remove skill directories on disk.
 
 ## Skill Directory Structure
 
