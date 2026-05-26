@@ -51,7 +51,7 @@ function getPool() {
     }
     return pool;
 }
-async function ensureSchema(db) {
+async function ensureBaseTable(db) {
     await db.query(`
     CREATE TABLE IF NOT EXISTS skills (
       id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -75,18 +75,53 @@ async function ensureSchema(db) {
   `);
     try {
         await db.query(`CREATE EXTENSION IF NOT EXISTS vector;`);
-        const dims = embeddingDimensions(EMBEDDING_MODEL);
-        console.error(`[skillsearch] embedding dimensions: ${dims}`);
-        const col = await db.query(`
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name = 'skills' AND column_name = 'embedding';
+        console.error("[skillsearch] pgvector extension ensured");
+    }
+    catch (err) {
+        console.warn(`[skillsearch] pgvector not available: ${err.message}`);
+    }
+}
+/**
+ * Ensure the embedding column matches the actual dimension from the API.
+ * mcphub pattern: detect dims from embedding.length, not from model name.
+ * Creates column if missing, resizes if mismatch, drops + recreates HNSW index.
+ * Returns true if dimensions changed (caller should resync all embeddings).
+ */
+async function ensureVectorColumn(db, dimsNeeded) {
+    // Get current column dimension from pg_attribute
+    let currentDims = 0;
+    try {
+        const result = await db.query(`
+      SELECT atttypmod AS dims FROM pg_attribute
+      WHERE attrelid = 'skills'::regclass AND attname = 'embedding';
     `);
-        if (col.rowCount === 0) {
-            const vecType = dims <= 2000 ? "vector" : "halfvec";
-            await db.query(`ALTER TABLE skills ADD COLUMN embedding ${vecType}(${dims});`);
-            console.error(`[skillsearch] created embedding column ${vecType}(${dims})`);
+        if (result.rowCount && result.rows[0].dims > 0) {
+            currentDims = result.rows[0].dims;
         }
-        if (dims <= 2000) {
+    }
+    catch {
+        // table might not have column yet
+    }
+    const vecType = dimsNeeded <= 2000 ? "vector" : "halfvec";
+    // Column does not exist → create it
+    if (currentDims === 0) {
+        await db.query(`ALTER TABLE skills ADD COLUMN embedding ${vecType}(${dimsNeeded});`);
+        console.error(`[skillsearch] created embedding column ${vecType}(${dimsNeeded})`);
+    }
+    else if (currentDims !== dimsNeeded) {
+        // Dimension mismatch → drop index, clear all data, resize column
+        console.error(`[skillsearch] dimension mismatch: DB=${currentDims}, API=${dimsNeeded}. Resizing...`);
+        await db.query(`DROP INDEX IF EXISTS idx_skills_embedding;`);
+        await db.query(`DELETE FROM skills;`);
+        await db.query(`ALTER TABLE skills ALTER COLUMN embedding TYPE ${vecType}(${dimsNeeded});`);
+        console.error(`[skillsearch] resized embedding column to ${vecType}(${dimsNeeded})`);
+    }
+    else {
+        console.error(`[skillsearch] embedding column already correct: ${vecType}(${dimsNeeded})`);
+    }
+    // Create HNSW index
+    try {
+        if (dimsNeeded <= 2000) {
             await db.query(`
         CREATE INDEX IF NOT EXISTS idx_skills_embedding
         ON skills USING hnsw (embedding vector_cosine_ops);
@@ -95,28 +130,15 @@ async function ensureSchema(db) {
         else {
             await db.query(`
         CREATE INDEX IF NOT EXISTS idx_skills_embedding
-        ON skills USING hnsw ((embedding::halfvec(${dims})) halfvec_cosine_ops);
+        ON skills USING hnsw ((embedding::halfvec(${dimsNeeded})) halfvec_cosine_ops);
       `);
         }
         console.error("[skillsearch] HNSW index ensured");
     }
     catch (err) {
-        console.warn(`[skillsearch] pgvector not available: ${err.message}`);
+        console.warn(`[skillsearch] HNSW index failed: ${err.message}`);
     }
-}
-function embeddingDimensions(model) {
-    const m = model.toLowerCase();
-    if (m.includes("text-embedding-3-large") || m.includes("gemini-embedding-001"))
-        return 3072;
-    if (m.includes("text-embedding-3-small") || m.includes("text-embedding-ada-002"))
-        return 1536;
-    if (m.includes("bge-m3") || m.includes("bge-large"))
-        return 1024;
-    if (m.includes("bge-base"))
-        return 768;
-    if (m.includes("bge-small"))
-        return 512;
-    return 1536;
+    return currentDims !== 0 && currentDims !== dimsNeeded;
 }
 // ---------------------------------------------------------------------------
 // Skill discovery — collect ALL files under skill dir (except SKILL.md)
@@ -552,10 +574,27 @@ async function main() {
         console.error(`[skillsearch] FATAL: db connect failed: ${err.message}`);
         process.exit(1);
     }
-    await ensureSchema(db);
-    // Initial full index
+    await ensureBaseTable(db);
+    // Discover skills first
     const skills = discoverSkills(SKILLS_DIR);
     console.error(`[skillsearch] ${skills.length} skills discovered`);
+    // If we have an embedding provider and skills, generate one embedding
+    // to detect the actual vector dimension (same pattern as mcphub).
+    if (skills.length > 0 && API_BASE_URL && API_KEY) {
+        try {
+            const sampleVec = await embed(skills[0].content);
+            const actualDims = sampleVec.length;
+            console.error(`[skillsearch] detected actual embedding dimension: ${actualDims}`);
+            const dimsChanged = await ensureVectorColumn(db, actualDims);
+            if (dimsChanged) {
+                console.error("[skillsearch] vector column was resized, clearing stale data for re-index");
+            }
+        }
+        catch (err) {
+            console.warn(`[skillsearch] dimension detection failed: ${err.message}`);
+        }
+    }
+    // Index all skills
     if (skills.length > 0) {
         for (const s of skills)
             await upsertSkill(db, s);
