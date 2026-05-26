@@ -21,7 +21,7 @@
   },
   "keywords": ["mcp", "skills", "search", "pgvector", "claude", "agent-skills"],
   "author": "",
-  "license": "GPL-3.0-or-later",
+  "license": "GPL-3.0-only",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3",
     "pg": "^8.14.1"

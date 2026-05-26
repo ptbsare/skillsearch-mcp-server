@@ -111,15 +111,39 @@ Detailed instructions here...
 
 ## Embedding Models
 
-Auto-detected dimensions:
+**Vector dimensions are auto-detected from the API response**, not guessed from the model name. At startup the server generates one sample embedding via `/embeddings` and reads the actual `embedding.length` returned by the provider — the same pattern used by mcphub.
+
+This means:
+- **Model-agnostic**: works with any OpenAI-compatible embedding provider (OpenAI, Azure OpenAI, Gemini, BGE, Jina, SiliconFlow, etc.) without hardcoded dimension tables
+- **Auto-adapts**: if you change `EMBEDDING_MODEL` to a model with different dimensions, the server detects the mismatch on next startup, resizes the pgvector column, clears stale data, and re-indexes everything
+- **pgvector type selection**: dimensions ≤ 2000 use `vector` type; dimensions > 2000 use `halfvec` type (pgvector limit is 2000 for `vector`, 4000 for `halfvec`)
+
+Common models and their typical dimensions:
 
 | Model | Dimensions | pgvector type |
 |---|---|---|
 | `gemini-embedding-001` | 3072 | halfvec |
 | `text-embedding-3-large` | 3072 | halfvec |
+| `jina-embeddings-v3` | 1024 | vector |
 | `text-embedding-3-small` | 1536 | vector |
 | `text-embedding-ada-002` | 1536 | vector |
 | `bge-m3` | 1024 | vector |
+| `bge-large-zh` | 1024 | vector |
+| `bge-base-zh` | 768 | vector |
+
+> **Note**: The table above is for reference only. The actual dimension is always determined by the API response, not by this table. Any model supported by your `API_BASE_URL` provider will work.
+
+### Dimension Mismatch Handling
+
+When the detected dimension differs from the existing database column:
+
+1. Existing HNSW index is dropped
+2. All rows in the `skills` table are cleared (stale embeddings with wrong dimensions)
+3. The `embedding` column type is resized (e.g. `vector(1536)` → `halfvec(3072)`)
+4. HNSW index is recreated
+5. All skills are re-indexed from disk
+
+This ensures the database always matches the provider's actual output, even after model changes.
 
 ## Database Setup
 
@@ -153,4 +177,4 @@ Table and HNSW index are created automatically on first run.
 
 ## License
 
-GPL-3.0-or-later
+GPLv3.0
