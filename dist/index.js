@@ -3,7 +3,10 @@
  *
  * Discovers Agent Skills from a directory, embeds SKILL.md content into
  * pgvector via an OpenAI-compatible /embeddings endpoint, and provides
- * semantic vector similarity search — same pattern as mcphub search_tools.
+ * semantic vector cosine similarity search — same pattern as mcphub.
+ *
+ * Auto-sync: watches the skills directory for changes (fs.watch) and
+ * falls back to periodic polling if native watching is unavailable.
  *
  * Environment variables (single naming):
  *   DB_URL                 - PostgreSQL connection string with pgvector
@@ -12,7 +15,8 @@
  *   EMBEDDING_MODEL        - Model name (default: text-embedding-3-small)
  *   SKILLSEARCH_SKILLS_DIR - Root directory; each subdirectory = one skill
  *   TRANSPORT              - "stdio" (default) or "http"
- *   PORT                   - HTTP port (default: 3000), only used when TRANSPORT=http
+ *   PORT                   - HTTP port (default: 3000)
+ *   WATCH_POLL_INTERVAL    - Polling interval ms (default: 30000), fallback only
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -34,6 +38,7 @@ const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL ?? "text-embedding-3-small";
 const SKILLS_DIR = process.env.SKILLSEARCH_SKILLS_DIR ?? "";
 const TRANSPORT = (process.env.TRANSPORT ?? "stdio").toLowerCase();
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
+const POLL_INTERVAL = parseInt(process.env.WATCH_POLL_INTERVAL ?? "30000", 10);
 // ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
@@ -144,9 +149,26 @@ function discoverSkills(rootDir) {
             content: raw,
             allFiles: allFiles.map((f) => path.resolve(f)),
         });
-        console.error(`[skillsearch] discovered "${name}": ${allFiles.length} files in ${skillDir}`);
     }
     return skills;
+}
+/** Scan a single skill dir and return entry, or null if invalid */
+function scanOneSkill(skillDir) {
+    skillDir = path.resolve(skillDir);
+    const entry = path.basename(skillDir);
+    const skillMdPath = path.join(skillDir, "SKILL.md");
+    if (!fs.existsSync(skillMdPath))
+        return null;
+    const raw = fs.readFileSync(skillMdPath, "utf-8");
+    const { frontmatter } = parseFrontmatter(raw);
+    const name = frontmatter["name"] ?? entry;
+    const absMd = path.resolve(skillMdPath);
+    const allFiles = walkFiles(skillDir).filter((f) => path.resolve(f) !== absMd);
+    return {
+        name, description: frontmatter["description"] ?? "", frontmatter,
+        skillMdPath: absMd, skillDir, content: raw,
+        allFiles: allFiles.map((f) => path.resolve(f)),
+    };
 }
 function parseFrontmatter(raw) {
     const frontmatter = {};
@@ -214,57 +236,174 @@ async function embed(text) {
     return vec;
 }
 // ---------------------------------------------------------------------------
-// Indexing — upsert with content-hash skip, same pattern as mcphub
+// Indexing helpers
 // ---------------------------------------------------------------------------
-async function indexSkills(db, skills) {
-    let indexed = 0;
-    for (const skill of skills) {
-        const hash = sha256(skill.content);
-        const existing = await db.query(`SELECT content_hash FROM skills WHERE skill_name = $1 AND skill_dir = $2`, [skill.name, skill.skillDir]);
-        if (existing.rowCount && existing.rows[0].content_hash === hash) {
-            console.error(`[skillsearch] "${skill.name}" unchanged, skip`);
-            continue;
+async function upsertSkill(db, skill) {
+    const hash = sha256(skill.content);
+    const existing = await db.query(`SELECT content_hash FROM skills WHERE skill_name = $1 AND skill_dir = $2`, [skill.name, skill.skillDir]);
+    if (existing.rowCount && existing.rows[0].content_hash === hash) {
+        console.error(`[skillsearch] "${skill.name}" unchanged, skip`);
+        return;
+    }
+    let embedding = null;
+    if (API_BASE_URL && API_KEY) {
+        try {
+            embedding = await embed(skill.content);
         }
-        let embedding = null;
-        if (API_BASE_URL && API_KEY) {
+        catch (err) {
+            console.warn(`[skillsearch] embed failed "${skill.name}": ${err.message}`);
+        }
+    }
+    if (embedding) {
+        await db.query(`INSERT INTO skills
+         (skill_name, skill_dir, skill_md_path, frontmatter, content, content_hash, all_files, embedding, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::vector,NOW())
+       ON CONFLICT (skill_name, skill_dir) DO UPDATE SET
+         skill_md_path = EXCLUDED.skill_md_path,
+         frontmatter   = EXCLUDED.frontmatter,
+         content       = EXCLUDED.content,
+         content_hash  = EXCLUDED.content_hash,
+         all_files     = EXCLUDED.all_files,
+         embedding     = EXCLUDED.embedding,
+         updated_at    = NOW()`, [skill.name, skill.skillDir, skill.skillMdPath, JSON.stringify(skill.frontmatter),
+            skill.content, hash, skill.allFiles, `[${embedding.join(",")}]`]);
+    }
+    else {
+        await db.query(`INSERT INTO skills
+         (skill_name, skill_dir, skill_md_path, frontmatter, content, content_hash, all_files, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+       ON CONFLICT (skill_name, skill_dir) DO UPDATE SET
+         skill_md_path = EXCLUDED.skill_md_path,
+         frontmatter   = EXCLUDED.frontmatter,
+         content       = EXCLUDED.content,
+         content_hash  = EXCLUDED.content_hash,
+         all_files     = EXCLUDED.all_files,
+         updated_at    = NOW()`, [skill.name, skill.skillDir, skill.skillMdPath, JSON.stringify(skill.frontmatter),
+            skill.content, hash, skill.allFiles]);
+    }
+    console.error(`[skillsearch] indexed "${skill.name}" (${skill.allFiles.length} files)`);
+}
+async function removeSkill(db, skillName, skillDirPath) {
+    const res = await db.query(`DELETE FROM skills WHERE skill_name = $1 AND skill_dir = $2`, [skillName, skillDirPath]);
+    if (res.rowCount && res.rowCount > 0) {
+        console.error(`[skillsearch] removed "${skillName}" from index`);
+    }
+}
+/** Full scan: index new/changed, remove deleted */
+async function syncAll(db) {
+    const skills = discoverSkills(SKILLS_DIR);
+    const currentKeys = new Set();
+    for (const skill of skills) {
+        currentKeys.add(`${skill.name}\0${skill.skillDir}`);
+        await upsertSkill(db, skill);
+    }
+    // Remove skills no longer on disk
+    const indexed = await db.query(`SELECT skill_name, skill_dir FROM skills`);
+    for (const row of indexed.rows) {
+        const key = `${row.skill_name}\0${row.skill_dir}`;
+        if (!currentKeys.has(key)) {
+            await removeSkill(db, row.skill_name, row.skill_dir);
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// File system watcher — auto sync on changes, with polling fallback
+// ---------------------------------------------------------------------------
+function startWatcher(db) {
+    // Try native fs.watch first
+    let usePolling = false;
+    let watcher = null;
+    // Debounce: coalesce rapid events into one sync
+    let debounceTimer = null;
+    const scheduleSync = () => {
+        if (debounceTimer)
+            clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(async () => {
             try {
-                embedding = await embed(skill.content);
+                console.error("[skillsearch] change detected, syncing...");
+                await syncAll(db);
+                console.error("[skillsearch] sync complete");
             }
             catch (err) {
-                console.warn(`[skillsearch] embed failed "${skill.name}": ${err.message}`);
+                console.error(`[skillsearch] sync error: ${err.message}`);
+            }
+        }, 500);
+    };
+    // Also watch each existing skill sub-dir for SKILL.md changes
+    const skillWatchers = new Map();
+    const watchSkillDir = (skillDirPath) => {
+        if (skillWatchers.has(skillDirPath))
+            return;
+        try {
+            const w = fs.watch(skillDirPath, { recursive: true }, (_event, filename) => {
+                if (filename === "SKILL.md" || filename === null) {
+                    scheduleSync();
+                }
+            });
+            w.on("error", () => { });
+            skillWatchers.set(skillDirPath, w);
+        }
+        catch {
+            // sub-dir watch failed, root watcher will catch it
+        }
+    };
+    // Watch the root skills directory for added/removed skill dirs
+    try {
+        watcher = fs.watch(SKILLS_DIR, { persistent: true }, (_event, filename) => {
+            if (filename) {
+                // A subdirectory was added/removed or renamed
+                scheduleSync();
+            }
+        });
+        watcher.on("error", (err) => {
+            console.error(`[skillsearch] fs.watch error: ${err.message}, falling back to polling`);
+            usePolling = true;
+            watcher?.close();
+            startPolling();
+        });
+        console.error("[skillsearch] fs.watch active on skills directory");
+        // Also watch each existing skill sub-dir
+        if (fs.existsSync(SKILLS_DIR)) {
+            for (const entry of fs.readdirSync(SKILLS_DIR, { withFileTypes: true })) {
+                if (entry.isDirectory()) {
+                    watchSkillDir(path.join(SKILLS_DIR, entry.name));
+                }
             }
         }
-        if (embedding) {
-            await db.query(`INSERT INTO skills
-           (skill_name, skill_dir, skill_md_path, frontmatter, content, content_hash, all_files, embedding, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::vector,NOW())
-         ON CONFLICT (skill_name, skill_dir) DO UPDATE SET
-           skill_md_path = EXCLUDED.skill_md_path,
-           frontmatter   = EXCLUDED.frontmatter,
-           content       = EXCLUDED.content,
-           content_hash  = EXCLUDED.content_hash,
-           all_files     = EXCLUDED.all_files,
-           embedding     = EXCLUDED.embedding,
-           updated_at    = NOW()`, [skill.name, skill.skillDir, skill.skillMdPath, JSON.stringify(skill.frontmatter),
-                skill.content, hash, skill.allFiles, `[${embedding.join(",")}]`]);
-        }
-        else {
-            await db.query(`INSERT INTO skills
-           (skill_name, skill_dir, skill_md_path, frontmatter, content, content_hash, all_files, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-         ON CONFLICT (skill_name, skill_dir) DO UPDATE SET
-           skill_md_path = EXCLUDED.skill_md_path,
-           frontmatter   = EXCLUDED.frontmatter,
-           content       = EXCLUDED.content,
-           content_hash  = EXCLUDED.content_hash,
-           all_files     = EXCLUDED.all_files,
-           updated_at    = NOW()`, [skill.name, skill.skillDir, skill.skillMdPath, JSON.stringify(skill.frontmatter),
-                skill.content, hash, skill.allFiles]);
-        }
-        indexed++;
-        console.error(`[skillsearch] indexed "${skill.name}" (${skill.allFiles.length} files)`);
     }
-    return indexed;
+    catch (err) {
+        console.error(`[skillsearch] fs.watch unavailable: ${err.message}`);
+        usePolling = true;
+    }
+    // Polling fallback
+    let pollTimer = null;
+    const startPolling = () => {
+        if (pollTimer)
+            return;
+        console.error(`[skillsearch] polling fallback every ${POLL_INTERVAL}ms`);
+        pollTimer = setInterval(async () => {
+            try {
+                await syncAll(db);
+            }
+            catch (err) {
+                console.error(`[skillsearch] poll sync error: ${err.message}`);
+            }
+        }, POLL_INTERVAL);
+    };
+    if (usePolling) {
+        startPolling();
+    }
+    // Clean up on process exit
+    const cleanup = () => {
+        watcher?.close();
+        for (const w of skillWatchers.values())
+            w.close();
+        if (pollTimer)
+            clearInterval(pollTimer);
+    };
+    process.on("exit", cleanup);
+    process.on("SIGINT", () => { cleanup(); process.exit(0); });
+    process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 }
 // ---------------------------------------------------------------------------
 // Search — pure vector cosine similarity, same as mcphub searchToolsByVector
@@ -298,7 +437,7 @@ async function searchSkills(db, query, limit, threshold) {
     }));
 }
 // ---------------------------------------------------------------------------
-// MCP Server — tools definition
+// MCP Server — tools definition (no skill_reindex)
 // ---------------------------------------------------------------------------
 function createServer() {
     const server = new Server({ name: "skillsearch-mcp-server", version: "1.0.0" }, { capabilities: { tools: {} } });
@@ -306,7 +445,7 @@ function createServer() {
         const tools = [
             {
                 name: "skill_search",
-                description: "Semantic vector search for Agent Skills. Returns matching skills with frontmatter metadata, SKILL.md absolute path, and ALL file paths under the skill directory (references, scripts, assets, templates, etc.). Use this to discover available skills before reading their full content.",
+                description: "Semantic vector search for Agent Skills. Returns matching skills with frontmatter metadata, SKILL.md absolute path, and ALL file paths under the skill directory (references, scripts, assets, templates, etc.). Skills are auto-indexed when added or modified — no manual reindex needed.",
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -333,11 +472,6 @@ function createServer() {
                 description: "List all indexed skills with names, descriptions, paths, and file counts.",
                 inputSchema: { type: "object", properties: {}, required: [] },
             },
-            {
-                name: "skill_reindex",
-                description: "Re-scan the skills directory and re-index all skills into the database. Use this after adding or modifying skills.",
-                inputSchema: { type: "object", properties: {}, required: [] },
-            },
         ];
         return { tools };
     });
@@ -354,7 +488,7 @@ function createServer() {
                 }
                 const results = await searchSkills(db, query, limit, threshold);
                 if (!results.length) {
-                    return { content: [{ type: "text", text: JSON.stringify({ query, threshold, totalResults: 0, message: "No matching skills found. Try a different query or lower the threshold.", skills: [] }, null, 2) }] };
+                    return { content: [{ type: "text", text: JSON.stringify({ query, threshold, totalResults: 0, message: "No matching skills found.", skills: [] }, null, 2) }] };
                 }
                 return { content: [{ type: "text", text: JSON.stringify({
                                 query, threshold, totalResults: results.length,
@@ -383,14 +517,6 @@ function createServer() {
                                 })),
                             }, null, 2) }] };
             }
-            case "skill_reindex": {
-                if (!SKILLS_DIR) {
-                    return { content: [{ type: "text", text: "Error: SKILLSEARCH_SKILLS_DIR not set" }], isError: true };
-                }
-                const skills = discoverSkills(SKILLS_DIR);
-                const indexed = await indexSkills(db, skills);
-                return { content: [{ type: "text", text: JSON.stringify({ message: "Reindex complete", skillsFound: skills.length, skillsIndexed: indexed, skillsDir: path.resolve(SKILLS_DIR) }, null, 2) }] };
-            }
             default:
                 return { content: [{ type: "text", text: `Unknown tool: ${request.params.name}` }], isError: true };
         }
@@ -398,7 +524,7 @@ function createServer() {
     return server;
 }
 // ---------------------------------------------------------------------------
-// Main — boot + connect transport (stdio or http)
+// Main
 // ---------------------------------------------------------------------------
 async function main() {
     console.error("[skillsearch] starting...");
@@ -427,18 +553,20 @@ async function main() {
         process.exit(1);
     }
     await ensureSchema(db);
+    // Initial full index
     const skills = discoverSkills(SKILLS_DIR);
     console.error(`[skillsearch] ${skills.length} skills discovered`);
     if (skills.length > 0) {
-        const n = await indexSkills(db, skills);
-        console.error(`[skillsearch] indexed ${n} (${skills.length - n} unchanged)`);
+        for (const s of skills)
+            await upsertSkill(db, s);
+        console.error(`[skillsearch] initial index complete`);
     }
-    // Create MCP server instance
+    // Start file watcher (auto-sync)
+    startWatcher(db);
+    // MCP server
     const mcpServer = createServer();
     if (TRANSPORT === "http") {
-        // ── Streamable HTTP transport ──────────────────────────────────────
         const httpServer = http.createServer((req, res) => {
-            // CORS headers
             res.setHeader("Access-Control-Allow-Origin", "*");
             res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
             res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
@@ -447,7 +575,6 @@ async function main() {
                 res.end();
                 return;
             }
-            // Only handle /mcp path (or root for simplicity)
             const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
             if (url.pathname !== "/mcp" && url.pathname !== "/") {
                 res.writeHead(404);
@@ -462,11 +589,9 @@ async function main() {
                     try {
                         parsedBody = JSON.parse(body);
                     }
-                    catch { /* let transport handle raw */ }
+                    catch { /* ok */ }
                 }
-                const transport = new StreamableHTTPServerTransport({
-                    sessionIdGenerator: undefined, // stateless mode
-                });
+                const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
                 res.on("close", () => transport.close());
                 await mcpServer.connect(transport);
                 await transport.handleRequest(req, res, parsedBody);
@@ -477,7 +602,6 @@ async function main() {
         });
     }
     else {
-        // ── stdio transport (default) ──────────────────────────────────────
         const transport = new StdioServerTransport();
         await mcpServer.connect(transport);
         console.error("[skillsearch] MCP server running on stdio");
