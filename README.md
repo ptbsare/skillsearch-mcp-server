@@ -1,94 +1,45 @@
 # SkillSearch MCP Server
 
-A standalone MCP server that discovers [Agent Skills](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview) from a directory, indexes their `SKILL.md` content into PostgreSQL with pgvector, and provides semantic search with reranking for AI agents.
-
-## Features
-
-- **Auto-discovery**: Scans a directory for skill folders (each containing `SKILL.md`)
-- **Vector search**: Embeds `SKILL.md` content into pgvector for semantic similarity search
-- **Reranking**: Supports OpenAI-compatible rerank APIs for improved result quality
-- **Full-text fallback**: Works without pgvector via PostgreSQL full-text search
-- **Frontmatter parsing**: Extracts YAML frontmatter from `SKILL.md` files
-- **Resource discovery**: Tracks `references/` and `scripts/` directories for each skill
-
-## Quick Start
-
-### Via npx
-
-```bash
-npx github:ptbsare/skillsearch-mcp-server
-```
-
-### Via local clone
-
-```bash
-git clone https://github.com/ptbsare/skillsearch-mcp-server.git
-cd skillsearch-mcp-server
-npm install
-npm run build
-SKILLSEARCH_DB_URL=postgresql://user:pass@localhost:5432/db \
-SKILLSEARCH_SKILLS_DIR=/path/to/skills \
-  node dist/index.js
-```
+MCP server that discovers [Agent Skills](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview) from a directory, embeds `SKILL.md` content into PostgreSQL pgvector, and provides semantic vector similarity search.
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `SKILLSEARCH_DB_URL` | **Yes** | PostgreSQL connection string (must have pgvector extension) |
-| `SKILLSEARCH_SKILLS_DIR` | **Yes** | Root directory containing skill subdirectories |
-| `SKILLSEARCH_RERANK_BASE_URL` | No | Rerank/embedding API base URL (e.g. `https://api.openai.com/v1`) |
-| `SKILLSEARCH_RERANK_API_KEY` | No | API key for the rerank/embedding provider |
-| `SKILLSEARCH_RERANK_MODEL` | No | Model name (default: `rerank-english-v3.0`) |
+| `DB_URL` | **Yes** | PostgreSQL connection string (must have pgvector) |
+| `SKILLSEARCH_SKILLS_DIR` | **Yes** | Root directory; each subdirectory = one skill |
+| `API_BASE_URL` | No | Embedding API base URL (e.g. `https://xxx/v1`) |
+| `API_KEY` | No | API key for the embedding provider |
+| `EMBEDDING_MODEL` | No | Model name (default: `text-embedding-3-small`) |
 
 ## MCP Tools
 
-### `skill_search`
-
-Search for skills by semantic query. Returns matching skills with frontmatter, paths, and similarity scores.
-
-Parameters:
-- `query` (string, required): Natural language search query
-- `limit` (integer, optional): Max results (default: 5, max: 50)
-- `threshold` (number, optional): Min similarity 0.0-1.0 (default: 0.3)
-
-### `skill_list`
-
-List all indexed skills with names, descriptions, and directory paths.
-
-### `skill_reindex`
-
-Re-scan the skills directory and re-index all skills. Use after adding or modifying skills.
+- **`skill_search`** — Semantic vector search. Returns frontmatter, SKILL.md path, and ALL file paths under the skill directory. Params: `query`, `limit` (default 5), `threshold` (default 0.3).
+- **`skill_list`** — List all indexed skills.
+- **`skill_reindex`** — Re-scan and re-index.
 
 ## Skill Directory Structure
 
 ```
 skills/
 ├── my-skill/
-│   ├── SKILL.md          # Main skill file with YAML frontmatter
-│   ├── references/       # Optional reference files
-│   │   └── guide.md
-│   └── scripts/          # Optional scripts
-│       └── run.sh
+│   ├── SKILL.md          # Required, with YAML frontmatter
+│   ├── references/       # Any files (recursively collected)
+│   ├── scripts/          # Any files (recursively collected)
+│   └── assets/           # Any other files/dirs (recursively collected)
 └── another-skill/
     └── SKILL.md
 ```
 
-### SKILL.md Format
+All files under the skill directory (except `SKILL.md` itself) are recursively collected and returned in search results so the LLM can read them on demand.
 
-```markdown
----
-name: my-skill
-description: A skill for doing something useful
-version: "1.0"
----
+## Run
 
-# My Skill
-
-Detailed instructions here...
+```bash
+npx github:ptbsare/skillsearch-mcp-server
 ```
 
-## Claude Desktop Configuration
+## Claude Desktop
 
 ```json
 {
@@ -97,27 +48,27 @@ Detailed instructions here...
       "command": "npx",
       "args": ["github:ptbsare/skillsearch-mcp-server"],
       "env": {
-        "SKILLSEARCH_DB_URL": "postgresql://user:pass@localhost:5432/skills_db",
+        "DB_URL": "postgresql://user:pass@localhost:5432/db",
         "SKILLSEARCH_SKILLS_DIR": "/path/to/skills",
-        "SKILLSEARCH_RERANK_BASE_URL": "https://api.openai.com/v1",
-        "SKILLSEARCH_RERANK_API_KEY": "sk-...",
-        "SKILLSEARCH_RERANK_MODEL": "rerank-english-v3.0"
+        "API_BASE_URL": "https://your-api/v1",
+        "API_KEY": "sk-...",
+        "EMBEDDING_MODEL": "gemini-embedding-001"
       }
     }
   }
 }
 ```
 
-## Database Setup
+## Database
 
-Requires PostgreSQL with the `pgvector` extension:
+Requires PostgreSQL with pgvector:
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION vector;
 ```
 
-The server auto-creates the `skills` table and HNSW index on first run.
+Table and HNSW index are created automatically on first run.
 
 ## License
 
-MIT
+GPL-3.0-or-later

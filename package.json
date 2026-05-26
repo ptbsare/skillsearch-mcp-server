@@ -1,7 +1,7 @@
 {
   "name": "skillsearch-mcp-server",
   "version": "1.0.0",
-  "description": "MCP server for semantic skill search with pgvector and reranking",
+  "description": "MCP server for semantic skill search with pgvector",
   "type": "module",
   "bin": {
     "skillsearch-mcp-server": "./bin/skillsearch-mcp-server"
@@ -16,20 +16,12 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
+    "dev": "tsx src/index.js",
     "prepare": "npm run build"
   },
-  "keywords": [
-    "mcp",
-    "skills",
-    "search",
-    "pgvector",
-    "reranking",
-    "claude",
-    "agent-skills"
-  ],
+  "keywords": ["mcp", "skills", "search", "pgvector", "claude", "agent-skills"],
   "author": "",
-  "license": "MIT",
+  "license": "GPL-3.0-or-later",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3",
     "pg": "^8.14.1"
@@ -37,7 +29,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/pg": "^8.11.0",
-    "tsx": "^4.22.3",
+    "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   }
 }
