@@ -16,6 +16,7 @@ MCP server that discovers [Agent Skills](https://platform.claude.com/docs/en/age
 | `TRANSPORT` | No | `stdio` | `stdio` or `http` |
 | `PORT` | No | `3000` | HTTP port (only when `TRANSPORT=http`) |
 | `WATCH_POLL_INTERVAL` | No | `30000` | Polling interval in ms (fallback mode only) |
+| `ENABLE_SKILL_LIST` | No | `false` | Set `true` to enable the `skill_list` tool |
 
 ## Transport Modes
 

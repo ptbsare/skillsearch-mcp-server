@@ -17,6 +17,7 @@
  *   TRANSPORT              - "stdio" (default) or "http"
  *   PORT                   - HTTP port (default: 3000)
  *   WATCH_POLL_INTERVAL    - Polling interval ms (default: 30000), fallback only
+ *   ENABLE_SKILL_LIST      - "true" to enable skill_list tool (default: false)
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -47,6 +48,7 @@ const SKILLS_DIR = process.env.SKILLSEARCH_SKILLS_DIR ?? "";
 const TRANSPORT = (process.env.TRANSPORT ?? "stdio").toLowerCase();
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 const POLL_INTERVAL = parseInt(process.env.WATCH_POLL_INTERVAL ?? "30000", 10);
+const ENABLE_SKILL_LIST = (process.env.ENABLE_SKILL_LIST ?? "").toLowerCase() === "true";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -566,12 +568,16 @@ function createServer(): Server {
           required: ["query"],
         },
       },
-      {
+    ];
+
+    if (ENABLE_SKILL_LIST) {
+      tools.push({
         name: "skill_list",
         description: "List all indexed skills with names, descriptions, paths, and file counts.",
         inputSchema: { type: "object", properties: {}, required: [] },
-      },
-    ];
+      });
+    }
+
     return { tools };
   });
 
@@ -643,6 +649,7 @@ async function main(): Promise<void> {
   console.error(`  SKILLS_DIR     = ${SKILLS_DIR || "MISSING"}`);
   console.error(`  TRANSPORT      = ${TRANSPORT}`);
   if (TRANSPORT === "http") console.error(`  PORT           = ${PORT}`);
+  console.error(`  ENABLE_SKILL_LIST= ${ENABLE_SKILL_LIST}`);
 
   if (!DB_URL) { console.error("[skillsearch] FATAL: DB_URL not set"); process.exit(1); }
   if (!SKILLS_DIR) { console.error("[skillsearch] FATAL: SKILLSEARCH_SKILLS_DIR not set"); process.exit(1); }

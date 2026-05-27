@@ -17,6 +17,7 @@
  *   TRANSPORT              - "stdio" (default) or "http"
  *   PORT                   - HTTP port (default: 3000)
  *   WATCH_POLL_INTERVAL    - Polling interval ms (default: 30000), fallback only
+ *   ENABLE_SKILL_LIST      - "true" to enable skill_list tool (default: false)
  */
 export {};
 //# sourceMappingURL=index.d.ts.map
