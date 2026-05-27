@@ -627,7 +627,7 @@ function createServer(): Server {
         const args = (request.params.arguments ?? {}) as Record<string, unknown>;
         const query = String(args.query ?? "");
         const limit = Math.min(Math.max(Number(args.limit ?? 5), 1), 50);
-        const threshold = Math.min(Math.max(Number(args.threshold ?? 0.3), 0), 1);
+        const threshold = Math.min(Math.max(Number(args.threshold ?? 0.5), 0), 1);
         if (!query) {
           return { content: [{ type: "text" as const, text: "Error: 'query' is required" }], isError: true };
         }
