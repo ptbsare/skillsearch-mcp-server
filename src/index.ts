@@ -561,8 +561,8 @@ function createServer(): Server {
             },
             threshold: {
               type: "number",
-              description: "Minimum similarity threshold 0.0–1.0 (default: 0.3). Higher = stricter.",
-              default: 0.3,
+              description: "Minimum similarity threshold 0.0–1.0 (default: 0.5). Higher = stricter.",
+              default: 0.5,
             },
           },
           required: ["query"],
@@ -604,7 +604,6 @@ function createServer(): Server {
           skills: results.map((r) => ({
             name: r.skill_name,
             description: r.frontmatter["description"] ?? "",
-            frontmatter: r.frontmatter,
             skillMdPath: r.skill_md_path,
             skillDir: r.skill_dir,
             similarity: Math.round(r.similarity * 10000) / 10000,
