@@ -151,28 +151,57 @@ function discoverSkills(rootDir) {
         console.warn(`[skillsearch] skills dir not found: ${rootDir}`);
         return skills;
     }
-    for (const entry of fs.readdirSync(rootDir, { withFileTypes: true })) {
-        if (!entry.isDirectory())
-            continue;
-        const skillDir = path.join(rootDir, entry.name);
-        const skillMdPath = path.join(skillDir, "SKILL.md");
-        if (!fs.existsSync(skillMdPath)) {
-            console.warn(`[skillsearch] no SKILL.md in ${skillDir}, skipping`);
+    // Recursively find all directories containing SKILL.md
+    // Supports both flat (skills/my-skill/SKILL.md) and
+    // category-grouped (skills/category/my-skill/SKILL.md) layouts
+    const stack = [rootDir];
+    while (stack.length) {
+        const current = stack.pop();
+        let entries;
+        try {
+            entries = fs.readdirSync(current, { withFileTypes: true });
+        }
+        catch {
             continue;
         }
-        const raw = fs.readFileSync(skillMdPath, "utf-8");
-        const { frontmatter } = parseFrontmatter(raw);
-        const name = frontmatter["name"] ?? entry.name;
-        const description = frontmatter["description"] ?? "";
-        const absMd = path.resolve(skillMdPath);
-        const allFiles = walkFiles(skillDir).filter((f) => path.resolve(f) !== absMd);
-        skills.push({
-            name, description, frontmatter,
-            skillMdPath: absMd,
-            skillDir: path.resolve(skillDir),
-            content: raw,
-            allFiles: allFiles.map((f) => path.resolve(f)),
-        });
+        let hasSkillMd = false;
+        const subdirs = [];
+        for (const entry of entries) {
+            if (entry.isDirectory()) {
+                subdirs.push(path.join(current, entry.name));
+            }
+            else if (entry.name === "SKILL.md") {
+                hasSkillMd = true;
+            }
+        }
+        if (hasSkillMd) {
+            // This directory is a skill root — parse it
+            const skillDir = path.resolve(current);
+            const skillMdPath = path.join(skillDir, "SKILL.md");
+            const raw = fs.readFileSync(skillMdPath, "utf-8");
+            const { frontmatter } = parseFrontmatter(raw);
+            // For category-grouped paths like skills/apple/findmy/SKILL.md,
+            // use the parent dir name as a display prefix if not overridden
+            const dirName = path.basename(skillDir);
+            const name = frontmatter["name"] ?? dirName;
+            const description = frontmatter["description"] ?? "";
+            const absMd = path.resolve(skillMdPath);
+            const allFiles = walkFiles(skillDir).filter((f) => path.resolve(f) !== absMd);
+            skills.push({
+                name, description, frontmatter,
+                skillMdPath: absMd,
+                skillDir,
+                content: raw,
+                allFiles: allFiles.map((f) => path.resolve(f)),
+            });
+            console.error(`[skillsearch] discovered "${name}" in ${skillDir}`);
+            // Don't recurse deeper — this IS the skill directory
+        }
+        else {
+            // No SKILL.md here — recurse into subdirectories (category folders)
+            for (const sd of subdirs)
+                stack.push(sd);
+        }
     }
     return skills;
 }
@@ -353,47 +382,72 @@ function startWatcher(db) {
             }
         }, 500);
     };
-    // Also watch each existing skill sub-dir for SKILL.md changes
-    const skillWatchers = new Map();
-    const watchSkillDir = (skillDirPath) => {
-        if (skillWatchers.has(skillDirPath))
-            return;
+    // Collect all directories that contain SKILL.md (recursively)
+    // This handles both flat and category-grouped layouts
+    const collectSkillDirs = (dir) => {
+        const result = [];
+        if (!fs.existsSync(dir))
+            return result;
+        let entries;
         try {
-            const w = fs.watch(skillDirPath, { recursive: true }, (_event, filename) => {
-                if (filename === "SKILL.md" || filename === null) {
-                    scheduleSync();
-                }
-            });
-            w.on("error", () => { });
-            skillWatchers.set(skillDirPath, w);
+            entries = fs.readdirSync(dir, { withFileTypes: true });
         }
         catch {
-            // sub-dir watch failed, root watcher will catch it
+            return result;
+        }
+        let hasSkillMd = false;
+        const subdirs = [];
+        for (const entry of entries) {
+            if (entry.name === "SKILL.md")
+                hasSkillMd = true;
+            else if (entry.isDirectory())
+                subdirs.push(path.join(dir, entry.name));
+        }
+        if (hasSkillMd) {
+            result.push(path.resolve(dir));
+        }
+        else {
+            for (const sd of subdirs) {
+                result.push(...collectSkillDirs(sd));
+            }
+        }
+        return result;
+    };
+    // Watch a directory recursively (covers skill dirs and category dirs)
+    const watchedDirs = new Set();
+    const watchDir = (dir) => {
+        if (watchedDirs.has(dir))
+            return;
+        watchedDirs.add(dir);
+        try {
+            const w = fs.watch(dir, { persistent: true }, () => scheduleSync());
+            w.on("error", () => { watchedDirs.delete(dir); });
+        }
+        catch {
+            // ignore
         }
     };
-    // Watch the root skills directory for added/removed skill dirs
     try {
-        watcher = fs.watch(SKILLS_DIR, { persistent: true }, (_event, filename) => {
-            if (filename) {
-                // A subdirectory was added/removed or renamed
-                scheduleSync();
-            }
-        });
+        // Watch the root
+        watcher = fs.watch(SKILLS_DIR, { persistent: true }, () => scheduleSync());
         watcher.on("error", (err) => {
             console.error(`[skillsearch] fs.watch error: ${err.message}, falling back to polling`);
             usePolling = true;
             watcher?.close();
             startPolling();
         });
-        console.error("[skillsearch] fs.watch active on skills directory");
-        // Also watch each existing skill sub-dir
+        watchedDirs.add(path.resolve(SKILLS_DIR));
+        // Watch all skill dirs and their category parent dirs
         if (fs.existsSync(SKILLS_DIR)) {
-            for (const entry of fs.readdirSync(SKILLS_DIR, { withFileTypes: true })) {
-                if (entry.isDirectory()) {
-                    watchSkillDir(path.join(SKILLS_DIR, entry.name));
-                }
+            for (const skillDir of collectSkillDirs(SKILLS_DIR)) {
+                watchDir(skillDir);
+                // Also watch the parent (category) dir so new siblings are detected
+                const parent = path.dirname(skillDir);
+                if (parent !== path.resolve(SKILLS_DIR))
+                    watchDir(parent);
             }
         }
+        console.error(`[skillsearch] fs.watch active on ${watchedDirs.size} directories`);
     }
     catch (err) {
         console.error(`[skillsearch] fs.watch unavailable: ${err.message}`);
@@ -420,8 +474,6 @@ function startWatcher(db) {
     // Clean up on process exit
     const cleanup = () => {
         watcher?.close();
-        for (const w of skillWatchers.values())
-            w.close();
         if (pollTimer)
             clearInterval(pollTimer);
     };

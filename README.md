@@ -81,18 +81,45 @@ No manual `skill_reindex` tool needed — just add, modify, or remove skill dire
 
 ## Skill Directory Structure
 
+Supports both **flat** and **category-grouped** layouts:
+
+### Flat (simple)
+
 ```
 skills/
 ├── my-skill/
 │   ├── SKILL.md              # Required, with YAML frontmatter
 │   ├── references/           # Any files (recursively collected)
 │   ├── scripts/              # Any files (recursively collected)
-│   ├── assets/               # Any files (recursively collected)
-│   └── templates/
-│       └── template.yml      # Also collected
+│   └── assets/               # Any files (recursively collected)
 └── another-skill/
     └── SKILL.md
 ```
+
+### Category-grouped (organized)
+
+```
+skills/
+├── apple/
+│   ├── findmy/
+│   │   ├── SKILL.md
+│   │   └── references/
+│   └── shortcuts/
+│       ├── SKILL.md
+│       └── scripts/
+├── google/
+│   ├── gmail-filters/
+│   │   └── SKILL.md
+│   └── calendar-sync/
+│       └── SKILL.md
+└── microsoft/
+    ├── excel-automation/
+    │   └── SKILL.md
+    └── word-templates/
+        └── SKILL.md
+```
+
+The server **recursively scans** the skills directory. Any subdirectory containing a `SKILL.md` file is treated as a skill. Intermediate directories (like `apple/`, `google/`) are treated as category groups and are transparent — they don't affect the skill name or behavior.
 
 **All files** under the skill directory (except `SKILL.md` itself) are recursively collected and returned in search results so the LLM can read them on demand.
 
