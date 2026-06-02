@@ -49,6 +49,7 @@ const TRANSPORT = (process.env.TRANSPORT ?? "stdio").toLowerCase();
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 const POLL_INTERVAL = parseInt(process.env.WATCH_POLL_INTERVAL ?? "30000", 10);
 const ENABLE_SKILL_LIST = (process.env.ENABLE_SKILL_LIST ?? "").toLowerCase() === "true";
+const ENABLE_SKILL_SEARCH_HINT = (process.env.ENABLE_SKILL_SEARCH_HINT ?? "true").toLowerCase() !== "false";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -573,18 +574,36 @@ async function searchSkills(
 // MCP Server — tools definition (no skill_reindex)
 // ---------------------------------------------------------------------------
 
-function createServer(): Server {
+function createServer(db: PoolType): Server {
   const server = new Server(
     { name: "skillsearch-mcp-server", version: "1.0.0" },
     { capabilities: { tools: {} } },
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
+    // Build the base description
+    let skillSearchDescription =
+      "Semantic vector search for Agent Skills. Returns matching skills with frontmatter metadata, SKILL.md absolute path, and ALL file paths under the skill directory (references, scripts, assets, templates, etc.). Skills are auto-indexed when added or modified — no manual reindex needed.";
+
+    // Optionally inject available skill names as a hint for the LLM
+    if (ENABLE_SKILL_SEARCH_HINT) {
+      try {
+        const result = await db.query(
+          `SELECT skill_name FROM skills ORDER BY skill_name`,
+        );
+        if (result.rowCount && result.rowCount > 0) {
+          const names = result.rows.map((r: any) => r.skill_name);
+          skillSearchDescription += `\n\nAvailable skills: ${names.join(", ")}.`;
+        }
+      } catch (err: any) {
+        console.warn(`[skillsearch] failed to fetch skill names for hint: ${err.message}`);
+      }
+    }
+
     const tools: Tool[] = [
       {
         name: "skill_search",
-        description:
-          "Semantic vector search for Agent Skills. Returns matching skills with frontmatter metadata, SKILL.md absolute path, and ALL file paths under the skill directory (references, scripts, assets, templates, etc.). Skills are auto-indexed when added or modified — no manual reindex needed.",
+        description: skillSearchDescription,
         inputSchema: {
           type: "object",
           properties: {
@@ -732,7 +751,7 @@ async function main(): Promise<void> {
   startWatcher(db);
 
   // MCP server
-  const mcpServer = createServer();
+  const mcpServer = createServer(db);
 
   if (TRANSPORT === "http") {
     const httpServer = http.createServer((req, res) => {
