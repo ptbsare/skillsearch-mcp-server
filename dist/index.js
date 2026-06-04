@@ -383,38 +383,10 @@ function startWatcher(db) {
             }
         }, 500);
     };
-    // Collect all directories that contain SKILL.md (recursively)
-    // This handles both flat and category-grouped layouts
-    const collectSkillDirs = (dir) => {
-        const result = [];
-        if (!fs.existsSync(dir))
-            return result;
-        let entries;
-        try {
-            entries = fs.readdirSync(dir, { withFileTypes: true });
-        }
-        catch {
-            return result;
-        }
-        let hasSkillMd = false;
-        const subdirs = [];
-        for (const entry of entries) {
-            if (entry.name === "SKILL.md")
-                hasSkillMd = true;
-            else if (entry.isDirectory())
-                subdirs.push(path.join(dir, entry.name));
-        }
-        if (hasSkillMd) {
-            result.push(path.resolve(dir));
-        }
-        else {
-            for (const sd of subdirs) {
-                result.push(...collectSkillDirs(sd));
-            }
-        }
-        return result;
-    };
-    // Watch a directory recursively (covers skill dirs and category dirs)
+    // Watch ALL directories recursively under SKILLS_DIR.
+    // fs.watch only monitors direct children, so intermediate directories
+    // (e.g. category groups like skills/xxx/) must also be watched to detect
+    // deeply nested skill creation/deletion at any depth.
     const watchedDirs = new Set();
     const watchDir = (dir) => {
         if (watchedDirs.has(dir))
@@ -429,7 +401,30 @@ function startWatcher(db) {
         }
     };
     try {
-        // Watch the root
+        // Recursively collect every directory under SKILLS_DIR
+        const allDirs = new Set();
+        const stack = [SKILLS_DIR];
+        while (stack.length) {
+            const current = stack.pop();
+            if (!fs.existsSync(current))
+                continue;
+            allDirs.add(path.resolve(current));
+            let entries;
+            try {
+                entries = fs.readdirSync(current, { withFileTypes: true });
+            }
+            catch {
+                continue;
+            }
+            for (const e of entries) {
+                if (e.isDirectory())
+                    stack.push(path.join(current, e.name));
+            }
+        }
+        // Watch every directory
+        for (const dir of allDirs)
+            watchDir(dir);
+        // Also keep a reference to the root watcher for cleanup
         watcher = fs.watch(SKILLS_DIR, { persistent: true }, () => scheduleSync());
         watcher.on("error", (err) => {
             console.error(`[skillsearch] fs.watch error: ${err.message}, falling back to polling`);
@@ -437,17 +432,6 @@ function startWatcher(db) {
             watcher?.close();
             startPolling();
         });
-        watchedDirs.add(path.resolve(SKILLS_DIR));
-        // Watch all skill dirs and their category parent dirs
-        if (fs.existsSync(SKILLS_DIR)) {
-            for (const skillDir of collectSkillDirs(SKILLS_DIR)) {
-                watchDir(skillDir);
-                // Also watch the parent (category) dir so new siblings are detected
-                const parent = path.dirname(skillDir);
-                if (parent !== path.resolve(SKILLS_DIR))
-                    watchDir(parent);
-            }
-        }
         console.error(`[skillsearch] fs.watch active on ${watchedDirs.size} directories`);
     }
     catch (err) {
