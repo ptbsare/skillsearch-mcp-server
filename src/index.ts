@@ -721,6 +721,17 @@ async function main(): Promise<void> {
 
   await ensureBaseTable(db);
 
+  // Clean up stale records from previous SKILLSEARCH_SKILLS_DIR values.
+  // If the env var changed, skills indexed under the old directory are no longer
+  // relevant and should be removed before we index the new directory.
+  const staleResult = await db.query(
+    `DELETE FROM skills WHERE skill_dir NOT LIKE $1`,
+    [`${SKILLS_DIR}%`],
+  );
+  if (staleResult.rowCount && staleResult.rowCount > 0) {
+    console.error(`[skillsearch] cleaned ${staleResult.rowCount} stale record(s) from previous skills directory`);
+  }
+
   // Discover skills first
   const skills = discoverSkills(SKILLS_DIR);
   console.error(`[skillsearch] ${skills.length} skills discovered`);
@@ -741,9 +752,9 @@ async function main(): Promise<void> {
     }
   }
 
-  // Index all skills
+  // Index all skills (full sync: upsert new/changed, remove deleted)
   if (skills.length > 0) {
-    for (const s of skills) await upsertSkill(db, s);
+    await syncAll(db);
     console.error(`[skillsearch] initial index complete`);
   }
 
