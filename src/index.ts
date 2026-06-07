@@ -415,7 +415,7 @@ async function syncAll(db: PoolType): Promise<void> {
 // File system watcher — auto sync on changes, with polling fallback
 // ---------------------------------------------------------------------------
 
-function startWatcher(db: PoolType): void {
+function startWatcher(db: PoolType, server: Server): void {
   // Try native fs.watch first
   let usePolling = false;
   let watcher: fs.FSWatcher | null = null;
@@ -428,6 +428,8 @@ function startWatcher(db: PoolType): void {
       try {
         console.error("[skillsearch] change detected, syncing...");
         await syncAll(db);
+        // Notify connected clients that the tool list has changed
+        server.sendToolListChanged();
         console.error("[skillsearch] sync complete");
       } catch (err: any) {
         console.error(`[skillsearch] sync error: ${err.message}`);
@@ -744,11 +746,11 @@ async function main(): Promise<void> {
     console.error(`[skillsearch] initial index complete`);
   }
 
-  // Start file watcher (auto-sync)
-  startWatcher(db);
-
-  // MCP server
+  // MCP server (must be created before startWatcher so we can notify clients)
   const mcpServer = createServer(db);
+
+  // Start file watcher (auto-sync), pass server to notify clients on changes
+  startWatcher(db, mcpServer);
 
   if (TRANSPORT === "http") {
     const httpServer = http.createServer((req, res) => {
